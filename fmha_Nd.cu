@@ -1,8 +1,16 @@
 #include "utils.h"
 #include <cstdio>
 #include <mma.h>
+#include <cmath>
+#include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
+#include <cuda_runtime.h>
+#include <iostream>
+#include <cstdlib>
+#include <cstring>
 
 using namespace nvcuda;
+namespace py = pybind11;
 
 template <const int Bx>
 struct GemmBlockTile {
@@ -191,20 +199,15 @@ struct LocalSoftmax {
     }
 
     __device__ inline void thread_softmax() {
+        thread_l = 0.0f;
+
         #pragma unroll
         for (int i=0; i<numbers_per_thread; ++i) {
             thread_fx[i] = expf(thread_mat_reg[i]-m_ij);
-        }
-    }
-
-    __device__ inline void thread_fx_sum() {
-        thread_l = 0.0f;
-        
-        #pragma unroll
-        for (int i=0; i<numbers_per_thread; ++i) {
             thread_l += thread_fx[i];
         }
     }
+
 
     __device__ inline void block_sum() {
         smem_reduce[(loop_id*loop_stride+warp_id)*32+lane_id] = thread_l;
@@ -264,7 +267,6 @@ struct LocalSoftmax {
             thread_max();
             block_max();
             thread_softmax();
-            thread_fx_sum();
             block_sum();
             save_local_result_to_smem();
         }
@@ -294,6 +296,7 @@ __device__ inline void update_o(
     float li_new, li, mi, mi_new, m_ij;
     float o_out[8];
 
+
     #pragma unroll
     for (int loop_id=0; loop_id<num_loops; ++loop_id) {
 
@@ -303,8 +306,6 @@ __device__ inline void update_o(
         mi = smem_reduce[row_id+2];
         li = smem_reduce[row_id+3];
         m_ij = smem_reduce[row_id+4];
-        printf("%.2f, %.2f, %.2f, %.2f, %.2f, %.2f, %.2f\n",li_new, mi_new, mi, li, m_ij, load_o_reg[0], load_pv_reg[0]);
-
 
         #pragma unroll
         for (int i=0; i<numbers_per_thread; ++i) {
@@ -312,6 +313,7 @@ __device__ inline void update_o(
             load_pv_reg[i] = smem_buffer_pv[LdIdx(loop_id*loop_stride+warp_id, i*32+lane_id, d)];
             o_out[i] =  (1/li_new)*((li*expf(mi-mi_new)*load_o_reg[i])+(expf(m_ij-mi_new)*load_pv_reg[i]));
             block_o[LdIdx(loop_id*loop_stride+warp_id, i*32+lane_id, d)] = o_out[i];
+            /* printf("%.2f\n",o_out[i]); */
         }
     }
 }
@@ -347,6 +349,8 @@ __global__ void FlashAttentionKernel(
     float *k_init;
     float *v_init;
 
+    /* printf("%d\n",num_loops); */
+
     __shared__ float smem_buffer[Br*Bc];
     __shared__ float smem_reduce[Br*32];
     __shared__ float smem_buffer_pv[Br*128];
@@ -359,69 +363,127 @@ __global__ void FlashAttentionKernel(
     }
 }
 
-const int N = 1024;
-const int d = 64;
+
 const int Br = 32;
-const int Bc = 64;
-const int Bx = 256;
-const int Gx = N / Br;
+const int Bc = 32;
+const int Bx = 128;
 
-int main() {
-    float *q = new float [N*d];
-    float *k = new float [d*N];
-    float *v = new float [N*d];
-    float *out = new float [N*d];
-    
-    for (int i=0; i<N*d; ++i) q[i] = 3.0f;
-    for (int i=0; i<N*d; ++i) k[i] = 3.0f;
-    for (int i=0; i<N*d; ++i) v[i] = 3.0f;
-    for (int i=0; i<N*d; ++i) out[i] = 0.0f;
-
+void fmha(cudaStream_t stream, void** buffers, const char * opaque, size_t opaque_len) {
     cudaError_t stat;
-    float *dq, *dk, *dv, *d_out;
-    float *global_max, *global_sum;
-    size_t nbytesQKV = sizeof(float) * N * d;
-    size_t nbytesSum = sizeof(float) * N;
+    std::cout << "CUSTOM XLAMBDA" << std::endl;
+    float *q = reinterpret_cast<float*>(buffers[0]);
+    float *k = reinterpret_cast<float*>(buffers[1]);
+    float *v = reinterpret_cast<float*>(buffers[2]);
+    float *o = reinterpret_cast<float*>(buffers[3]);
+    
+    int N,d;
+    std::memcpy(&N, opaque, 4);
+    std::memcpy(&d, opaque+4, 4);
+    
+    /* std::cout << d << std::endl; */
 
-    stat = cudaMalloc(&dq, nbytesQKV);
-    CUDACheck(stat, "malloc");
-    stat = cudaMalloc(&dk, nbytesQKV);
-    CUDACheck(stat, "malloc");
-    stat = cudaMalloc(&dv, nbytesQKV);
-    CUDACheck(stat, "malloc");
-    stat = cudaMalloc(&d_out, nbytesQKV);
-    CUDACheck(stat, "malloc");
+    float *gmem_sum = new float [N];
+    float *gmem_max = new float [N];
     
+    for (int i=0; i<N; ++i) {
+        gmem_sum[i] = 0.0f;
+        gmem_max[i] = -INFINITY;
+    }
     
-    stat = cudaMalloc(&global_max, nbytesSum);
-    CUDACheck(stat, "malloc");
-    stat = cudaMalloc(&global_sum, nbytesSum);
-    CUDACheck(stat, "malloc");
-
-    stat = cudaMemcpy(dq, q, nbytesQKV, cudaMemcpyHostToDevice);
-    CUDACheck(stat, "memcpy");
-    stat = cudaMemcpy(dk, k, nbytesQKV, cudaMemcpyHostToDevice);
-    CUDACheck(stat, "memcpy");
-    stat = cudaMemcpy(dv, v, nbytesQKV, cudaMemcpyHostToDevice);
-    CUDACheck(stat, "memcpy");
-    stat = cudaMemcpy(d_out, out, nbytesQKV, cudaMemcpyHostToDevice);
-    CUDACheck(stat, "memcpy");
+    float *d_gmem_sum, *d_gmem_max;
+    stat = cudaMalloc(&d_gmem_sum, sizeof(float)*N);
+    CUDACPPCheck(stat, "malloc")
+    stat = cudaMalloc(&d_gmem_max, sizeof(float)*N);
+    CUDACPPCheck(stat, "malloc")
+    stat = cudaMemcpy(d_gmem_max, gmem_max, sizeof(float)*N, cudaMemcpyHostToDevice);
+    CUDACPPCheck(stat, "memcpy")
+    stat = cudaMemcpy(d_gmem_sum, gmem_sum, sizeof(float)*N, cudaMemcpyHostToDevice);
+    CUDACPPCheck(stat, "memcpy")
     
-    stat = cudaMemset(global_max, 0, nbytesSum);
-    CUDACheck(stat, "memset");
-    stat = cudaMemset(global_sum, 0, nbytesSum);
-    CUDACheck(stat, "memset");
-    
-TimerInit
-TimerStart
-    FlashAttentionKernel<Br ,Bc, Bx><<<Gx,Bx>>>(dq, dk, dv,d_out, global_sum, global_max, N, d);
-    cudaDeviceSynchronize();
+    int Gx = N / Br;
+    size_t nbytesSMEM = sizeof(float)*(Br*Bc+Br*32+Br*128);
+    FlashAttentionKernel<Br, Bc, Bx><<<Gx,Bx,nbytesSMEM,stream>>>(q, k, v, o, d_gmem_sum, d_gmem_max, N, d);
     stat = cudaGetLastError();
-    CUDACheck(stat, "kernel");
-    cudaMemcpy(out, d_out, nbytesQKV, cudaMemcpyDeviceToHost);
-TimerEnd("KK")
-    /* for (int i=0; i<N*d; ++i) { */
-    /*     printf("%.2f ", out[i]); */
-    /* } */
-    return 0;
+    CUDACPPCheck(stat, "kernel")
+    cudaDeviceSynchronize();
 }
+
+PYBIND11_MODULE(fmha, m) {
+    m.doc() = "SUSTensorTest of Kenel";
+    m.def("fmha", 
+        /* & py_cuda_add, */
+        [](){
+        const char* name = "xla._CUSTOM_CALL_TARGET";
+        return py::capsule((void *) &fmha, name);
+        },
+        "Test of fmha"
+    );
+}
+
+/*  */
+/* const int N = 1024; */
+/* const int d = 64; */
+/* const int Br = 32; */
+/* const int Bc = 64; */
+/* const int Bx = 256; */
+/* const int Gx = N / Br; */
+/*  */
+/* int main() { */
+/*     float *q = new float [N*d]; */
+/*     float *k = new float [d*N]; */
+/*     float *v = new float [N*d]; */
+/*     float *out = new float [N*d]; */
+/*      */
+/*     for (int i=0; i<N*d; ++i) q[i] = 3.0f; */
+/*     for (int i=0; i<N*d; ++i) k[i] = 3.0f; */
+/*     for (int i=0; i<N*d; ++i) v[i] = 3.0f; */
+/*     for (int i=0; i<N*d; ++i) out[i] = 0.0f; */
+/*  */
+/*     cudaError_t stat; */
+/*     float *dq, *dk, *dv, *d_out; */
+/*     float *global_max, *global_sum; */
+/*     size_t nbytesQKV = sizeof(float) * N * d; */
+/*     size_t nbytesSum = sizeof(float) * N; */
+/*  */
+/*     stat = cudaMalloc(&dq, nbytesQKV); */
+/*     CUDACheck(stat, "malloc"); */
+/*     stat = cudaMalloc(&dk, nbytesQKV); */
+/*     CUDACheck(stat, "malloc"); */
+/*     stat = cudaMalloc(&dv, nbytesQKV); */
+/*     CUDACheck(stat, "malloc"); */
+/*     stat = cudaMalloc(&d_out, nbytesQKV); */
+/*     CUDACheck(stat, "malloc"); */
+/*      */
+/*      */
+/*     stat = cudaMalloc(&global_max, nbytesSum); */
+/*     CUDACheck(stat, "malloc"); */
+/*     stat = cudaMalloc(&global_sum, nbytesSum); */
+/*     CUDACheck(stat, "malloc"); */
+/*  */
+/*     stat = cudaMemcpy(dq, q, nbytesQKV, cudaMemcpyHostToDevice); */
+/*     CUDACheck(stat, "memcpy"); */
+/*     stat = cudaMemcpy(dk, k, nbytesQKV, cudaMemcpyHostToDevice); */
+/*     CUDACheck(stat, "memcpy"); */
+/*     stat = cudaMemcpy(dv, v, nbytesQKV, cudaMemcpyHostToDevice); */
+/*     CUDACheck(stat, "memcpy"); */
+/*     stat = cudaMemcpy(d_out, out, nbytesQKV, cudaMemcpyHostToDevice); */
+/*     CUDACheck(stat, "memcpy"); */
+/*      */
+/*     stat = cudaMemset(global_max, 0, nbytesSum); */
+/*     CUDACheck(stat, "memset"); */
+/*     stat = cudaMemset(global_sum, 0, nbytesSum); */
+/*     CUDACheck(stat, "memset"); */
+/*      */
+/* TimerInit */
+/* TimerStart */
+/*     FlashAttentionKernel<Br ,Bc, Bx><<<Gx,Bx>>>(dq, dk, dv,d_out, global_sum, global_max, N, d); */
+/*     cudaDeviceSynchronize(); */
+/*     stat = cudaGetLastError(); */
+/*     CUDACheck(stat, "kernel"); */
+/*     cudaMemcpy(out, d_out, nbytesQKV, cudaMemcpyDeviceToHost); */
+/* TimerEnd("KK") */
+/*     for (int i=0; i<N*d; ++i) { */
+/*         printf("%.2f ", out[i]); */
+/*     } */
+/*     return 0; */
+/* } */

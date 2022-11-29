@@ -1,16 +1,13 @@
 # %%
 
+!bash compile.sh
+
 import jax
 import jax.numpy as jnp
-import flmm
+import fmha
 from jaxlib import xla_client
 
-xla_client.register_custom_call_target(b"local_softmax", flmm.local_softmax(), platform="gpu")
-
-# %%
-
-mat = jnp.ones((64,64))
-mat
+xla_client.register_custom_call_target(b"local_softmax", fmha.fmha(), platform="gpu")
 
 # %%
 
@@ -30,7 +27,7 @@ from jax._src import abstract_arrays
 @sm_p.def_abstract_eval
 def py_add_abeval(a):
     assert a.shape == (64,64)
-    return abstract_arrays.ShapedArray(a.shape)
+    return abstract_arrays.ShapedArray(a.shape, a.dtype)
 
 # %%
 
@@ -41,24 +38,25 @@ xops = xla_client.ops
 
 c = xla_client.XlaBuilder("comp_builder")
 
-def py_add_translation(xla_builder, a, b):
-    shape = xla_client.Shape.array_shape(np.dtype("float32"), (64,64), (0,))
+def local_sm_translation(xla_builder, a):
+    shape = xla_client.Shape.array_shape(np.dtype("float32"), (64,64), (1,0))
+    br_shape = xla_client.Shape.array_shape(np.dtype("float32"),(64,),(0,))
     opaque = b"This is opaque"
     print(f"Type of a is {type(a)}")
     print(f"Type of shape is {type(shape)}")
     return xops.CustomCallWithLayout(
         xla_builder,
-        b"py_add_xla",
-        operands=(a, b),
+        b"local_softmax",
+        operands=(a,),
         shape_with_layout=shape,
-        operand_shapes_with_layout=(shape, shape),
+        operand_shapes_with_layout=(shape,),
         opaque=opaque,
         # has_side_effect=False,
         # schedule=0,
         # api_version=1,
     )
 
-xla.backend_specific_translations["gpu"][py_add_p] = py_add_translation
+xla.backend_specific_translations["gpu"][sm_p] = local_sm_translation
 
 """
     builder: XlaBuilder,
@@ -72,5 +70,39 @@ xla.backend_specific_translations["gpu"][py_add_p] = py_add_translation
     api_version: CustomCallApiVersion = ...,
 """
 
-shape = xla_client.Shape.array_shape(np.dtype("float32"), (128,), (0,))
-shape
+# %%
+
+from jax import random
+rng = random.PRNGKey(42)
+mat = random.normal(rng,(64,64))
+# mat = jnp.ones((64,64)) * 2
+b = jax.jit(local_sm_prim)(mat)
+c = jax.nn.softmax(mat)
+
+# %%
+
+mat[0]
+
+# %%
+
+b
+
+# %%
+
+c
+# %%
+
+jnp.sum(b-c)
+
+# %%
+
+jnp.sum(jnp.exp(mat[0]-jnp.max(mat[0])))
+
+# %%
+
+m = jnp.max(mat[0])
+fx = jnp.exp(mat[0]-m)
+fx/jnp.sum(fx)
+
+# %%
+

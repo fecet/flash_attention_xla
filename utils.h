@@ -42,14 +42,18 @@ inline void print_matrix(matrix_t<T> mat, int type) {
 #define CUBLASCheck(stat,fn_name) \
     if (stat != CUBLAS_STATUS_SUCCESS) { \
         printf ("CUBLAS failed at %s, with state %d\n", fn_name, stat); \
-        return EXIT_FAILURE; \
     } \
 
 #define CUDACheck(stat,fn_name) \
     if (stat != cudaSuccess) { \
         printf ("CUDA Failed at %s, with state %d\n", fn_name, stat); \
         printf ("Error Message: %s\n", cudaGetErrorString(stat)); \
-        return EXIT_FAILURE; \
+    } \
+
+#define CUDACPPCheck(stat, fn_name) \
+    if (stat != cudaSuccess) { \
+        std::cout << "CUDA Failed at " << fn_name << " with stat " << stat << std::endl; \
+        std::cout << "Error Message: " << cudaGetErrorString(stat) << std::endl; \
     } \
 
 #define Timer(seg_name,seg) do { \

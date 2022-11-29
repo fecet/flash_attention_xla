@@ -1,3 +1,5 @@
 .ipynb_checkpoints
 *.so
 gemm
+*.ipynb
+jax_test.sync.ipynb

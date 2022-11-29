@@ -1,8 +1,10 @@
 #include <cstdio>
+#include <cmath>
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <cuda_runtime.h>
 #include <pybind11/pybind11.h>
+#include <iostream>
 #include "utils.h"
 
 namespace py = pybind11;
@@ -25,11 +27,13 @@ struct LocalSoftmax {
     int warp_id, lane_id, tid;
     int loop_id;
 
+    float *out;
+
     __device__ LocalSoftmax (
-        float *smem_mat, float *smem_reduce, float *gmem_sum, float *gmem_max
+        float *smem_mat, float *smem_reduce, float *gmem_sum, float *gmem_max, float *out
     ): 
     smem_mat(smem_mat), smem_reduce(smem_reduce), gmem_sum(gmem_sum), gmem_max(gmem_max),
-    tid(threadIdx.x), warp_id(threadIdx.x/32), lane_id(threadIdx.x%32), loop_id(0)
+    tid(threadIdx.x), warp_id(threadIdx.x/32), lane_id(threadIdx.x%32), loop_id(0),out(out)
     {}
 
     __device__ inline void load_mat_to_reg() {
@@ -38,6 +42,11 @@ struct LocalSoftmax {
             thread_mat_reg[i] = smem_mat[
                 LdIdx(loop_id*loop_stride+warp_id,32*i+lane_id,Bc)
             ];
+        if (loop_id*loop_stride+warp_id == 0){
+            printf("row_id:%d, col_id:%d, value:%.2f, smem_mat:%.2f\n",loop_id*loop_stride+warp_id, 32*i+lane_id, thread_mat_reg[i],smem_mat[
+                LdIdx(loop_id*loop_stride+warp_id,32*i+lane_id,Bc)
+            ]);    
+        }
         }
     }
 
@@ -79,17 +88,12 @@ struct LocalSoftmax {
     }
 
     __device__ inline void thread_softmax() {
+        thread_l = 0.0f;
         #pragma unroll
         for (int i=0; i<numbers_per_thread; ++i) {
             thread_fx[i] = expf(thread_mat_reg[i]-m_ij);
-        }
-    }
-
-    __device__ inline void thread_fx_sum() {
-        thread_l = 0.0f;
-        
-        #pragma unroll
-        for (int i=0; i<numbers_per_thread; ++i) {
+            /* if (loop_id == 0 && warp_id == 0) */
+                /* printf("tid:%d, i:%.d, v:%.2f, fx:%.2f\n", tid, i, thread_mat_reg[i], thread_fx[i]); */
             thread_l += thread_fx[i];
         }
     }
@@ -121,10 +125,6 @@ struct LocalSoftmax {
 
     __device__ inline void save_local_result_to_smem() {
         /* smem_reduce[(loop_id*loop_stride+warp_id)] */
-        #pragma unroll
-        for (int i=0; i<numbers_per_thread; ++i) {
-            smem_mat[LdIdx(loop_id*loop_stride+warp_id,32*i+lane_id,Bc)] = thread_fx[i];
-        }
         if (lane_id == 0) {
             float mi = gmem_max[loop_id*loop_stride+warp_id];
             float li = gmem_sum[loop_id*loop_stride+warp_id];
@@ -140,19 +140,28 @@ struct LocalSoftmax {
 
             gmem_max[loop_id*loop_stride+warp_id] = mi_new;
             gmem_sum[loop_id*loop_stride+warp_id] = li_new;
+            /* printf("num_loops:%d, loop_id:%d, warp_id:%d, tid:%d, row_id:%d,mi_new:%.2f, in_gmem:%.2f\n",num_loops,loop_id,warp_id,tid,(loop_id*loop_stride+warp_id),mi_new,gmem_max[loop_id*loop_stride+warp_id]); */
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int i=0; i<numbers_per_thread; ++i) {
+            out[LdIdx(loop_id*loop_stride+warp_id,32*i+lane_id,Bc)] = thread_fx[i] / l_ij;
+            if (loop_id*loop_stride+warp_id==0){
+            /* printf("%.2f, %.2f\n", thread_fx[i], l_ij); */
+            }
         }
         __syncthreads();
     }
 
     __device__ inline void softmax_loop() {
         loop_id = 0;
-        #pragma unroll
-        for (int i=0; i<Br; i+=loop_stride,++loop_id) {
+        /* #pragma unroll */
+        for (int i=0; i<num_loops; ++i,++loop_id) {
             load_mat_to_reg();
             thread_max();
             block_max();
             thread_softmax();
-            thread_fx_sum();
             block_sum();
             save_local_result_to_smem();
         }
@@ -160,41 +169,54 @@ struct LocalSoftmax {
 };
 
 template <const int Br, const int Bc, const int Bx>
-__global__ void softmaxkernel(float *mat, float *reduce, float *gmem_sum, float *gmem_max) {
-    LocalSoftmax<Br, Bc, Bx>(mat, reduce, gmem_sum, gmem_max).softmax_loop();
+__global__ void softmaxkernel(float *mat, float *reduce, float *gmem_sum, float *gmem_max, float *out) {
+    LocalSoftmax<Br, Bc, Bx>(mat, reduce, gmem_sum, gmem_max,out).softmax_loop();
 }
 
 const int Br = 64;
 const int Bc = 64;
-const int Bx = 128;
+const int Bx = 512;
+
+using std::cout;
 
 void LocalSoftmaxTest(cudaStream_t stream, void** buffers, const char * opaque, size_t opaque_len) {
-    printf("Now Using Custom XLA\n");
+    /* printf("Now Using Custom XLA\n"); */
+    std::cout << "Now Using Custom XLA" << std::endl;
     float *d_mat = reinterpret_cast<float*>(buffers[0]);
-    float *out = reinterpret_cast<float*>(buffers[1]);
+    float *d_out = reinterpret_cast<float*>(buffers[1]);
+    /* float *sum_out = reinterpret_cast<float*>(buffers[2]); */
+    /* float *max_out = reinterpret_cast<float*>(buffers[3]); */
 
     float *reduce = new float [Br*32];
     float *gmem_sum = new float [Br];
     float *gmem_max = new float [Br];
-
+    
     for (int i=0; i<Br*32; ++i) reduce[i] = 0.0f;
     for (int i=0; i<Br; ++i) gmem_sum[i] = 0.0f;
-    for (int i=0; i<Br; ++i) gmem_max[i] = 0.0f;
-
-    float *d_reduce, *d_gmem_sum, *d_gmem_max;
+    for (int i=0; i<Br; ++i) gmem_max[i] = -INFINITY;
+    
+    float *d_gmem_max ,*d_reduce, *d_gmem_sum; // *d_gmem_max;
     cudaMalloc(&d_reduce, sizeof(float)*32*Br);
     cudaMalloc(&d_gmem_max, sizeof(float)*Br);
     cudaMalloc(&d_gmem_sum, sizeof(float)*Br);
-
+    
     cudaMemcpy(d_reduce, reduce, sizeof(float)*32*Br, cudaMemcpyHostToDevice);
     cudaMemcpy(d_gmem_sum, gmem_sum, sizeof(float)*Br, cudaMemcpyHostToDevice);
     cudaMemcpy(d_gmem_max, gmem_max, sizeof(float)*Br, cudaMemcpyHostToDevice);
+    
+    softmaxkernel<Br, Bc, Bx><<<1,Bx,0,stream>>>(d_mat, d_reduce,d_gmem_sum, d_gmem_max, d_out);
 
-    softmaxkernel<Br, Bc, Bx><<<1,Bx,0,stream>>>(d_mat, d_reduce, d_gmem_sum, d_gmem_max);
-    cudaMemcpy(out, d_mat, sizeof(float)*Br*Bc, cudaMemcpyDeviceToDevice);
-    cudaFree(d_reduce);
-    cudaFree(d_gmem_max);
-    cudaFree(d_gmem_sum);
+    /* void **out = new void * [3]; */
+    /* out[0] = (void*)d_out; */
+    /* out[1] = (void*)d_gmem_sum; */
+    /* out[2] = (void*)d_gmem_max; */
+    /* buffers[1] = (void*)out; */
+    /* cudaMemcpy(sum_out, gmem_sum, sizeof(float)*Br, cudaMemcpyDeviceToDevice); */
+    /* cudaMemcpy(max_out, gmem_sum, sizeof(float)*Br, cudaMemcpyDeviceToDevice); */
+    /* cudaMemcpy() */
+    /* cudaFree(d_reduce); */
+    /* cudaFree(d_gmem_max); */
+    /* cudaFree(d_gmem_sum); */
 }
 
 PYBIND11_MODULE(flmm, m) {
