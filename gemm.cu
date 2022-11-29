@@ -1,218 +1,183 @@
 /* #include <__clang_cuda_builtin_vars.h> */
-#include <cstddef>
-#include <cstdlib>
 #include <cstdio>
 #include <mma.h>
-#include <cublas_v2.h>
+#include "utils.h"
 
-
-#define CUDACheck(stat,fn_name) \
-    if (stat != cudaSuccess) { \
-        printf ("CUDA Failed at %s, with state %d\n", fn_name, stat); \
-        return EXIT_FAILURE; \
-    } \
-
-// All Row Major
 using namespace nvcuda;
 
-#define RowIdx(i,j,width) ((width)*(i)+(j))
-#define FetchFloat4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
+template <const int Bm, const int Bn, const int Bx>
+struct GemmBlockTile {
+    static const int num_per_thread = Bm*Bn/Bx;
+    int warp_id, lane_id, tid;
+    int warp_tile_y, warp_tile_x;
+    int ntile_y, ntile_x;
+    float* warpA, *warpB;
+    int ldaA, ldaB, ldaBlock;
+    float* warp_smem_buffer;
+    float* block_smem_buffer;
 
-struct MMAidx {
-    int x;
-    int y;
-};
+    wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> frag_a;
+    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> frag_b;
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> frag_c;
 
-const int vitual_warp_size = 64;
+    float accum[2][Bm*Bn/Bx] = {0.0f};
 
-template <const int Br, const int Bc, const int Bx, const int By>
-struct ThreadParam {
-    const int tx, ty;
-    MMAidx mma_idx;
-    int tid;
-    int warp_id;
-    int nmma_x, nmma_y;
-    int num_reg_per_thread;
-    
-    __device__ explicit ThreadParam(): 
-    tx(threadIdx.x), ty(threadIdx.y),
-    num_reg_per_thread(Bc*Br/(Bx*By))
+    __device__ GemmBlockTile(
+        float* blockA, float* blockB, float* smem_buffer,
+        int ldaA, int ldaB
+    ):  ldaA(ldaA), ldaB(ldaB), ldaBlock(Bn), tid(threadIdx.x), warp_id(threadIdx.x/32),
+        lane_id(threadIdx.x%32), ntile_y(Bm/16), ntile_x(Bn/16), block_smem_buffer(smem_buffer)
     {
-        nmma_y = Br / 16;
-        nmma_x = Bc / 16;
-        tid = ty*Bx + tx;
-        warp_id = tid / vitual_warp_size;
-        mma_idx.y = warp_id / nmma_x;
-        mma_idx.x = warp_id % nmma_x;
+        warp_tile_y = warp_id / ntile_x;
+        warp_tile_x = warp_id % ntile_x;
+        warpA = blockA + 16 * ldaA * warp_tile_y;
+        warpB = blockB + 16 * warp_tile_x;
+        warp_smem_buffer = smem_buffer + 16 * ldaBlock * warp_tile_y + 16 * warp_tile_x;
     }
-};
-
-template <const int Br, const int Bc, const int Bx, const int By>
-struct MMAGemm { // For a block
-    ThreadParam<Br, Bc, Bx, By> params;
-    float* smem_c;
-    float* smem_buffer_start;
-    float* smem_buffer; // const
-
-    float* a;
-    float* b;
-    int aw;
-    int bw;
     
-    float accum[2][Br*Bc/(Bx*By)/4][4] = {0.0f};
-
-    wmma::fragment<wmma::matrix_a, 16,16,8, wmma::precision::tf32, wmma::row_major> a_frag;
-    wmma::fragment<wmma::matrix_b, 16,16,8, wmma::precision::tf32, wmma::row_major> b_frag;
-    wmma::fragment<wmma::accumulator, 16, 16, 8, float> c_frag;
-
-    __device__ MMAGemm(
-        float* smem_c, float* smem_bfs, 
-        float* a_start, float* b_start,
-        int aw, int bw
-    ):
-        params(),
-        smem_c(smem_c), smem_buffer_start(smem_bfs),
-        aw(aw), bw(bw)
-    {
-        a = a_start + 16*aw*params.mma_idx.y;
-        b = b_start + 16*params.mma_idx.x;
-        /* smem_buffer = smem_bfs + (16*16)*(params.mma_idx.y*params.nmma_x+params.mma_idx.x); */
-        smem_buffer = smem_bfs + 16*bw*params.mma_idx.y + 16*params.mma_idx.x;
-        /* printf("tid:%d warpid:%d mma_idx=%d,%d\n", params.tid, params.warp_id,params.mma_idx.y,params.mma_idx.x);    */
+    __device__ inline void fill_load() {
+        wmma::fill_fragment(frag_c, 0.0f);
+        wmma::load_matrix_sync(frag_a, warpA, ldaA);
+        wmma::load_matrix_sync(frag_b, warpB, ldaB);
     }
-
-    __device__ void fill_load() {
-        wmma::fill_fragment(c_frag, 0.0f);
-        wmma::load_matrix_sync(a_frag, a, aw);
-        wmma::load_matrix_sync(b_frag, b, bw);
+    
+    __device__ inline void move_ab() {
+        warpA += 8;
+        warpB += 8 * ldaB;
     }
-
-    __device__ inline void mma() {wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);}
-    __device__ inline void store() {wmma::store_matrix_sync(smem_buffer, c_frag, bw, wmma::mem_row_major);}
-    __device__ inline void move_ab() { a += 8; b += 8*bw;}
+    
+    __device__ inline void mma() {
+        wmma::mma_sync(frag_c, frag_a, frag_b, frag_c);
+    }
+    
+    __device__ inline void save_buffer() {
+        wmma::store_matrix_sync(warp_smem_buffer, frag_c, ldaBlock, wmma::mem_row_major);
+    }
+    
     __device__ inline void load_to_accum() {
-        // smem_buffer is 16x16
-        // Assume that Br*Bc/(Bx*By) = 4 or 8 or ...
-        int stride = By*Bx*4;
-        int tid = params.tid;
+        /* FetchFloat4(accum[1][0]) = FetchFloat4(block_smem_buffer[tid*4]); */
         #pragma unroll
-        for(int i=0, j=0; i<Br*Bc; i+=stride, ++j) 
-            FetchFloat4(accum[1][j][0]) = FetchFloat4(smem_buffer_start[tid*4]);
+        for (int i=0,j=0; i<num_per_thread; i+=4,++j) 
+            FetchFloat4(accum[1][i]) = FetchFloat4(block_smem_buffer[j*4*Bx+tid*4]);
 
         #pragma unroll
-        for (int y=0; y<Br*Bc/(Bx*By)/4; ++y) {
-            #pragma unroll
-            for (int x=0; x<4; ++x)
-                accum[0][y][x] += accum[1][y][x];
-        }
-    }
-    __device__ inline void copy_to_smem() {
-        int stride = By*Bx*4;
-        int tid = params.tid;
-
-        #pragma unroll
-        for(int i=0, j=0; i<Br*Bc; i+=stride, ++j) 
-            /* FetchFloat4(accum[1][j][0]) = FetchFloat4(smem_buffer_start[tid*4]); */
-            FetchFloat4(smem_c[tid*4]) = FetchFloat4(accum[0][j][0]);
+        for (int i=0; i<num_per_thread; ++i)
+            accum[0][i] += accum[1][i];
     }
     
-    __device__ inline void calculate_mma_all() {
+    __device__ inline void save_to_block_out() {
         #pragma unroll
-        for (int i=0; i<(aw/8); ++i) {
+        for (int i=0,j=0; i<num_per_thread; i+=4,++j)
+            FetchFloat4(block_smem_buffer[j*4*Bx+tid*4]) = FetchFloat4(accum[0][i]);
+    }
+    
+    __device__ inline void calculate_gemm() {
+        #pragma unroll
+        for (int i=0; i<(ldaA/8); ++i) {
             fill_load();
             mma();
-            store();
+            save_buffer();
             __syncthreads();
             load_to_accum();
             move_ab();
         }
-        copy_to_smem();
+        save_to_block_out();
         __syncthreads();
     }
 };
+
 
 const int M = 32;
 const int N = 32;
 const int K = 32;
 
-const int Br = 32;
-const int Bc = 32;
-const int Bx = 16;
-const int By = 16;
+const int Bm = 32;
+const int Bn = 32;
+const int Bx = 128;
 
-__global__ void gemm_tc_kernel(float* a, float* b, float* c) {
+__global__ void gemm_tc_kernel(float* a, float*b, float* c){
+    float* blockA = a;
+    float* blockB = b;
+    const int ldaA = K;
+    const int ldaB = N;
+    
+    /* __shared__ float smem_buffer[Bm*Bn]; */
+    GemmBlockTile<Bm, Bn, Bx>* gemm = new GemmBlockTile<Bm, Bn, Bx>(blockA, blockB, c, ldaA, ldaB);
+    gemm->calculate_gemm();
+    delete gemm;
 
-    const int nmma_y = Br / 16;
-    const int nmma_x = Bc / 16;
-    const int n_floats = nmma_y * nmma_x * 16 * 16;
-    __shared__ float smem_c[n_floats];
-    __shared__ float smem_buffer[n_floats];
-    MMAGemm<Br, Bc, Bx, By> gemm(smem_c, smem_buffer, a, b, 32, 32);
-    gemm.calculate_mma_all();
-    for (int i=0; i<n_floats; ++i) {
-        c[i] = smem_c[i];
-    }
+    /* #pragma unroll */
+    /* for (int i=0,j=0; i<gemm.num_per_thread; i+=4,++j) */
+    /*     FetchFloat4(c[j*gemm.tid*4]) = FetchFloat4(smem_buffer[j*gemm.tid*4]); */
 }
 
 int main() {
-    float *a = new float[32*32];
-    float *b = new float[32*32];
-    float *c = new float[32*32];
+    float *a = new float[M*K];
+    float *b = new float[K*N];
+    float *c = new float[M*N];
 
-    for (int i=0; i<32*32; ++i) {
-        a[i] = i;
-        b[i] = i;
-        c[i] = 0.0f;
-    }
+    /* for (int i=0; i<M*K; ++i) a[i] = (float)rand() / RAND_MAX; */
+    /* for (int i=0; i<N*K; ++i) b[i] = (float)rand() / RAND_MAX; */
+    for (int i=0; i<M*K; ++i) a[i] = i;
+    for (int i=0; i<N*K; ++i) b[i] = i;
+    for (int i=0; i<M*N; ++i) c[i] = 0.0f;
 
+    float *da, *db, *dc;
+    size_t nbytesA = sizeof(float) * M * K;
+    size_t nbytesB = sizeof(float) * K * N;
+    size_t nbytesC = sizeof(float) * M * N;
 
-    float *da, *db;
-    float *dc;
-    size_t nbytes = sizeof(float) * 1024;
-    size_t nbytes_float = sizeof(float) * 1024;
     cudaError_t stat;
-    stat = cudaMalloc(&da, nbytes);
+    stat = cudaMalloc(&da, nbytesA);
     CUDACheck(stat, "malloc");
-    stat = cudaMalloc(&db, nbytes);
+    stat = cudaMalloc(&db, nbytesB);
     CUDACheck(stat, "malloc");
-    stat = cudaMalloc(&dc, nbytes_float);
+    stat = cudaMalloc(&dc, nbytesC);
     CUDACheck(stat, "malloc");
 
-    stat = cudaMemcpy(da, a, nbytes, cudaMemcpyHostToDevice);
+    stat = cudaMemcpy(da, a, nbytesA, cudaMemcpyHostToDevice);
     CUDACheck(stat, "memcpy");
-    stat = cudaMemcpy(db, b, nbytes, cudaMemcpyHostToDevice);
+    stat = cudaMemcpy(db, b, nbytesB, cudaMemcpyHostToDevice);
     CUDACheck(stat, "memcpy");
-    stat = cudaMemcpy(dc, c, nbytes_float, cudaMemcpyHostToDevice);
-    CUDACheck(stat, "memcpy");
-
-    dim3 block_dim;
-    block_dim.x = Bx;
-    block_dim.y = By;
-    gemm_tc_kernel<<<1,block_dim>>>(da, db, dc);
+    
+    gemm_tc_kernel<<<1,Bx>>>(da, db, dc);
+    cudaDeviceSynchronize();
     stat = cudaGetLastError();
     CUDACheck(stat, "kernel");
-    cudaDeviceSynchronize();
 
-    cudaMemcpy(c, dc, nbytes_float, cudaMemcpyDeviceToHost);
+    cudaMemcpy(c, dc, nbytesC, cudaMemcpyDeviceToHost);
+    CUDACheck(stat, "memcpy_back");
 
-    float *blas_c = new float [1024];
-    for (int i=0; i<1024; ++i) blas_c[i] = 0.0f;
-    cublasHandle_t blas_handle;  
+    cudaFree(dc);
+
+    float *blas_c = new float [M*N];
+    float *blas_dc;
+    stat = cudaMalloc(&blas_dc, nbytesC);
+    CUDACheck(stat, "blas_dc malloc");
+    for (int i=0; i<M*N; ++i) blas_c[i] = 0.0f;
+
+    cublasHandle_t blas_handle;
     cublasCreate(&blas_handle);
+    cublasStatus_t blas_stat;
     float alpha = 1.0;
     float beta = 0;
-    cudaMemcpy( dc, blas_c, sizeof(float)*1024, cudaMemcpyHostToDevice);
-    cublasSgemm_v2(blas_handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, db, N, da, K, &beta, dc, N);
-    cudaMemcpy(blas_c, dc, sizeof(float)*1024, cudaMemcpyDeviceToHost);
-
-    for (int i=0; i<32; ++i)
-        for (int j=0; j<32; ++j) {
-            float c_ij = c[i*32+j];
-            float c1_ij = blas_c[i*32+j];
-            printf("[%d][%d]: delta = %.2f\n",i,j,c_ij-c1_ij);
-        }
-
+    stat = cudaMemcpy(blas_dc, blas_c, nbytesC, cudaMemcpyHostToDevice);
+    CUDACheck(stat, "memcpy blas t")
+    blas_stat = cublasSgemm_v2(blas_handle, CUBLAS_OP_N, CUBLAS_OP_N, N, M, K, &alpha, db, N, da, K, &beta, blas_dc, N);
+    CUBLASCheck(blas_stat, "cublas");
+    cudaMemcpy(blas_c, blas_dc, nbytesC, cudaMemcpyDeviceToHost);
+    float eps = 0.01;
+    for (int i=0; i<M*N; ++i) {
+        printf("%d my: %.4f, blas: %.4f ",i,c[i],blas_c[i]);
+        printf("delta: %.4f\n",c[i]-blas_c[i]);
+        /* } */
+    }
     return 0;
 }
+
+
+
+
+
 
 
