@@ -2,15 +2,15 @@
 #include <cstdio>
 #include <mma.h>
 #include <cmath>
-#include <pybind11/pybind11.h>
-#include <pybind11/numpy.h>
+/* #include <pybind11/pybind11.h> */
+/* #include <pybind11/numpy.h> */
 #include <cuda_runtime.h>
 #include <iostream>
 #include <cstdlib>
 #include <cstring>
 
 using namespace nvcuda;
-namespace py = pybind11;
+/* namespace py = pybind11; */
 
 template <const int Bx>
 struct GemmBlockTilePV {
@@ -87,8 +87,8 @@ struct GemmBlockTilePV {
         /* } */
         #pragma unroll
         for (int i=0; i<numbers_per_thread; ++i) {
-            /* accum[numbers_per_thread+i] = blockC[LdIdx((Bx*i+tid)/Bc, (Bx*i+tid)%Bc, ldaC)]; */
-            accum[numbers_per_thread+i] = blockC[1024*128];
+            accum[numbers_per_thread+i] = blockC[LdIdx((Bx*i+tid)/Bc, (Bx*i+tid)%Bc, ldaC)];
+            /* accum[numbers_per_thread+i] = blockC[1024*128]; */
         }
 
         #pragma unroll
