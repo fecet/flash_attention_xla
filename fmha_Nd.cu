@@ -87,8 +87,8 @@ struct GemmBlockTilePV {
         /* } */
         #pragma unroll
         for (int i=0; i<numbers_per_thread; ++i) {
-            accum[numbers_per_thread+i] = blockC[LdIdx((Bx*i+tid)/Bc, (Bx+i+tid)%Bc, ldaC)];
-            /* accum[numbers_per_thread+i] = blockC[1024*128]; */
+            /* accum[numbers_per_thread+i] = blockC[LdIdx((Bx*i+tid)/Bc, (Bx*i+tid)%Bc, ldaC)]; */
+            accum[numbers_per_thread+i] = blockC[1024*128];
         }
 
         #pragma unroll
