@@ -13,6 +13,132 @@ using namespace nvcuda;
 namespace py = pybind11;
 
 template <const int Bx>
+struct GemmBlockTilePV {
+
+    int Br, Bc;
+    int ntile_y; 
+    int ntile_x; 
+    int num_warps; 
+    int tiles_per_warp; 
+    int num_loops; 
+    int loop_stride; 
+    int numbers_per_thread; 
+
+    int Bd;
+    float *blockA, *blockB, *blockC;
+    int ldaA, ldaB, ldaC;
+    float *warpA, *warpB, *warpC;
+    float accum[32] = {0.0f};
+
+    int loop_id;
+    int tid, warp_id, lane_id;
+    int warp_tile_y, warp_tile_x;
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> frag_a;
+    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::row_major> frag_b;
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> frag_c;
+    
+    __device__ GemmBlockTilePV(float* blockA, int ldaA, float *blockB, int ldaB, float *blockC, int ldaC, int Br, int Bc, int Bd):
+    blockA(blockA), blockB(blockB), blockC(blockC), ldaA(ldaA), ldaB(ldaB), ldaC(ldaC), Br(Br), Bc(Bc), Bd(Bd),
+    loop_id(0), tid(threadIdx.x), warp_id(threadIdx.x/32), lane_id(threadIdx.x%32)
+    {
+        ntile_y = Br / 16;
+        ntile_x = Bc / 16;
+        num_warps = Bx / 32;
+        tiles_per_warp = (ntile_y * ntile_x + num_warps - 1) / num_warps;
+        num_loops = tiles_per_warp;
+        loop_stride = num_warps;
+        numbers_per_thread = Br*Bc/Bx;
+    }
+
+    __device__ inline void move_block_ab() {
+        blockA += 8;
+        blockB += 8 * ldaB;
+    }
+
+    __device__ inline void get_warp_abc() {
+        warpA = blockA + 16 * ldaA * warp_tile_y;
+        warpB = blockB + 16 * warp_tile_x;
+        warpC = blockC + 16 * ldaC * warp_tile_y + 16 * warp_tile_x;
+    }
+
+    __device__ inline void get_warp_tile_xy() {
+        warp_tile_y = (loop_id * loop_stride + warp_id) / ntile_x;
+        warp_tile_x = (loop_id * loop_stride + warp_id) % ntile_x;
+    }
+
+    __device__ inline void fill_load() {
+        wmma::fill_fragment(frag_c, 0.0f);
+        wmma::load_matrix_sync(frag_a, warpA, ldaA);
+        wmma::load_matrix_sync(frag_b, warpB, ldaB);
+    }
+    
+    __device__ inline void mma() { wmma::mma_sync(frag_c, frag_a, frag_b, frag_c); }
+
+    __device__ inline void store() { wmma::store_matrix_sync(warpC, frag_c, ldaC, wmma::mem_row_major); }
+    
+    __device__ inline void load_to_accum() {
+
+        /* #pragma unroll */
+        /* for (int i=0; i<numbers_per_thread; i+=2) { */
+        /*     FetchFloat2(accum[numbers_per_thread+i]) = FetchFloat2( */
+        /*     blockC[LdIdx((Bx*i+tid*2)/Bc,(Bx*i+tid*2)%Bc,ldaC)] */
+        /*     ); */
+        /* } */
+        #pragma unroll
+        for (int i=0; i<numbers_per_thread; ++i) {
+            accum[numbers_per_thread+i] = blockC[LdIdx((Bx*i+tid)/Bc, (Bx+i+tid)%Bc, ldaC)];
+            /* accum[numbers_per_thread+i] = blockC[1024*128]; */
+        }
+
+        #pragma unroll
+        for (int i=0; i<numbers_per_thread; ++i)
+            accum[i] += accum[numbers_per_thread+i];
+    }
+
+    __device__ inline void save_to_block_out() {
+        /* #pragma unroll */
+        /* for (int i=0; i<numbers_per_thread; i+=2) */
+        /*     FetchFloat2( */
+        /*         blockC[LdIdx((Bx*i+tid*2)/Bc,(Bx*i+tid*2)%Bc,ldaC)] */
+        /*     ) = FetchFloat2(accum[i]); */
+        #pragma unroll
+        for (int i=0; i<numbers_per_thread; ++i) {
+            blockC[LdIdx((Bx*i+tid)/Bc, (Bx+i+tid)%Bc, ldaC)] = accum[i];
+        }
+    }
+
+    __device__ inline void loop_mma_store() {
+        loop_id = 0;
+
+        #pragma unroll
+        for (int i=0; i<num_loops; ++i) {
+            get_warp_tile_xy();
+            get_warp_abc();
+            fill_load();
+            mma();
+            store();
+            loop_id ++;
+        }
+        __syncthreads();
+    }
+
+    __device__ inline void calculate_gemm() {
+        
+        #pragma unroll
+        for (int i=0; i<(Bd/8); ++i) {
+            if (i != 0) {
+                move_block_ab();
+            }
+            loop_mma_store();
+            load_to_accum();
+        }
+        save_to_block_out();
+        __syncthreads();
+    }
+};
+
+template <const int Bx>
 struct GemmBlockTile {
 
     int Br, Bc;
@@ -28,7 +154,7 @@ struct GemmBlockTile {
     float *blockA, *blockB, *blockC;
     int ldaA, ldaB, ldaC;
     float *warpA, *warpB, *warpC;
-    float accum[32];
+    float accum[32] = {0.0f};
 
     int loop_id;
     int tid, warp_id, lane_id;
@@ -79,11 +205,15 @@ struct GemmBlockTile {
     
     __device__ inline void load_to_accum() {
 
+        /* #pragma unroll */
+        /* for (int i=0; i<numbers_per_thread; i+=2) { */
+        /*     FetchFloat2(accum[numbers_per_thread+i]) = FetchFloat2( */
+        /*     blockC[LdIdx((Bx*i+tid*2)/Bc,(Bx*i+tid*2)%Bc,ldaC)] */
+        /*     ); */
+        /* } */
         #pragma unroll
-        for (int i=0; i<numbers_per_thread; i+=2) {
-            FetchFloat2(accum[numbers_per_thread+i]) = FetchFloat2(
-            blockC[LdIdx((Bx*i+tid*2)/Bc,(Bx*i+tid*2)%Bc,ldaC)]
-            );
+        for (int i=0; i<numbers_per_thread; ++i) {
+            accum[numbers_per_thread+i] = blockC[LdIdx((Bx*i+tid)/Bc, (Bx+i+tid)%Bc, ldaC)];
         }
 
         #pragma unroll
@@ -92,11 +222,15 @@ struct GemmBlockTile {
     }
 
     __device__ inline void save_to_block_out() {
+        /* #pragma unroll */
+        /* for (int i=0; i<numbers_per_thread; i+=2) */
+        /*     FetchFloat2( */
+        /*         blockC[LdIdx((Bx*i+tid*2)/Bc,(Bx*i+tid*2)%Bc,ldaC)] */
+        /*     ) = FetchFloat2(accum[i]); */
         #pragma unroll
-        for (int i=0; i<numbers_per_thread; i+=2)
-            FetchFloat2(
-                blockC[LdIdx((Bx*i+tid*2)/Bc,(Bx*i+tid*2)%Bc,ldaC)]
-            ) = FetchFloat2(accum[i]);
+        for (int i=0; i<numbers_per_thread; ++i) {
+            blockC[LdIdx((Bx*i+tid)/Bc, (Bx+i+tid)%Bc, ldaC)] = accum[i];
+        }
     }
 
     __device__ inline void loop_mma_store() {
@@ -118,9 +252,11 @@ struct GemmBlockTile {
         
         #pragma unroll
         for (int i=0; i<(Bd/8); ++i) {
+            if (i != 0) {
+                move_block_ab();
+            }
             loop_mma_store();
             load_to_accum();
-            move_block_ab();
         }
         save_to_block_out();
         __syncthreads();
@@ -287,9 +423,13 @@ __device__ inline void update_o(
     int num_loops = Br / num_warps;
     int numbers_per_thread = d / 32;
     int loop_stride = num_warps;
+
+    /* float temp = smem_buffer_pv[64*128]; */
+    /* printf("%.2f\n",temp); */
     
-    GemmBlockTile<Bx> gemm_pv(smem_mat, Bc, v_init, d, smem_buffer_pv, ldaPV, Br, d, Bc);
+    GemmBlockTilePV<Bx> gemm_pv(smem_mat, Bc, v_init, d, smem_buffer_pv, ldaPV, Br, d, Bc);
     gemm_pv.calculate_gemm();
+    printf("HERE\n");
     
     float load_o_reg[8];
     float load_pv_reg[8];
@@ -408,82 +548,81 @@ void fmha(cudaStream_t stream, void** buffers, const char * opaque, size_t opaqu
     cudaDeviceSynchronize();
 }
 
-PYBIND11_MODULE(fmha, m) {
-    m.doc() = "SUSTensorTest of Kenel";
-    m.def("fmha", 
-        /* & py_cuda_add, */
-        [](){
-        const char* name = "xla._CUSTOM_CALL_TARGET";
-        return py::capsule((void *) &fmha, name);
-        },
-        "Test of fmha"
-    );
-}
+/* PYBIND11_MODULE(fmha, m) { */
+/*     m.doc() = "SUSTensorTest of Kenel"; */
+/*     m.def("fmha",  */
+/*         [](){ */
+/*         const char* name = "xla._CUSTOM_CALL_TARGET"; */
+/*         return py::capsule((void *) &fmha, name); */
+/*         }, */
+/*         "Test of fmha" */
+/*     ); */
+/* } */
 
-/*  */
-/* const int N = 1024; */
-/* const int d = 64; */
+
+const int N = 128;
+const int d = 128;
 /* const int Br = 32; */
 /* const int Bc = 64; */
 /* const int Bx = 256; */
-/* const int Gx = N / Br; */
-/*  */
-/* int main() { */
-/*     float *q = new float [N*d]; */
-/*     float *k = new float [d*N]; */
-/*     float *v = new float [N*d]; */
-/*     float *out = new float [N*d]; */
-/*      */
-/*     for (int i=0; i<N*d; ++i) q[i] = 3.0f; */
-/*     for (int i=0; i<N*d; ++i) k[i] = 3.0f; */
-/*     for (int i=0; i<N*d; ++i) v[i] = 3.0f; */
-/*     for (int i=0; i<N*d; ++i) out[i] = 0.0f; */
-/*  */
-/*     cudaError_t stat; */
-/*     float *dq, *dk, *dv, *d_out; */
-/*     float *global_max, *global_sum; */
-/*     size_t nbytesQKV = sizeof(float) * N * d; */
-/*     size_t nbytesSum = sizeof(float) * N; */
-/*  */
-/*     stat = cudaMalloc(&dq, nbytesQKV); */
-/*     CUDACheck(stat, "malloc"); */
-/*     stat = cudaMalloc(&dk, nbytesQKV); */
-/*     CUDACheck(stat, "malloc"); */
-/*     stat = cudaMalloc(&dv, nbytesQKV); */
-/*     CUDACheck(stat, "malloc"); */
-/*     stat = cudaMalloc(&d_out, nbytesQKV); */
-/*     CUDACheck(stat, "malloc"); */
-/*      */
-/*      */
-/*     stat = cudaMalloc(&global_max, nbytesSum); */
-/*     CUDACheck(stat, "malloc"); */
-/*     stat = cudaMalloc(&global_sum, nbytesSum); */
-/*     CUDACheck(stat, "malloc"); */
-/*  */
-/*     stat = cudaMemcpy(dq, q, nbytesQKV, cudaMemcpyHostToDevice); */
-/*     CUDACheck(stat, "memcpy"); */
-/*     stat = cudaMemcpy(dk, k, nbytesQKV, cudaMemcpyHostToDevice); */
-/*     CUDACheck(stat, "memcpy"); */
-/*     stat = cudaMemcpy(dv, v, nbytesQKV, cudaMemcpyHostToDevice); */
-/*     CUDACheck(stat, "memcpy"); */
-/*     stat = cudaMemcpy(d_out, out, nbytesQKV, cudaMemcpyHostToDevice); */
-/*     CUDACheck(stat, "memcpy"); */
-/*      */
-/*     stat = cudaMemset(global_max, 0, nbytesSum); */
-/*     CUDACheck(stat, "memset"); */
-/*     stat = cudaMemset(global_sum, 0, nbytesSum); */
-/*     CUDACheck(stat, "memset"); */
-/*      */
-/* TimerInit */
-/* TimerStart */
-/*     FlashAttentionKernel<Br ,Bc, Bx><<<Gx,Bx>>>(dq, dk, dv,d_out, global_sum, global_max, N, d); */
-/*     cudaDeviceSynchronize(); */
-/*     stat = cudaGetLastError(); */
-/*     CUDACheck(stat, "kernel"); */
-/*     cudaMemcpy(out, d_out, nbytesQKV, cudaMemcpyDeviceToHost); */
-/* TimerEnd("KK") */
-/*     for (int i=0; i<N*d; ++i) { */
-/*         printf("%.2f ", out[i]); */
-/*     } */
-/*     return 0; */
-/* } */
+const int Gx = N / Br;
+
+int main() {
+    float *q = new float [N*d];
+    float *k = new float [d*N];
+    float *v = new float [N*d];
+    float *out = new float [N*d];
+    
+    for (int i=0; i<N*d; ++i) q[i] = 3.0f;
+    for (int i=0; i<N*d; ++i) k[i] = 3.0f;
+    for (int i=0; i<N*d; ++i) v[i] = 3.0f;
+    for (int i=0; i<N*d; ++i) out[i] = 0.0f;
+
+    cudaError_t stat;
+    float *dq, *dk, *dv, *d_out;
+    float *global_max, *global_sum;
+    size_t nbytesQKV = sizeof(float) * N * d;
+    size_t nbytesSum = sizeof(float) * N;
+
+    stat = cudaMalloc(&dq, nbytesQKV);
+    CUDACheck(stat, "malloc");
+    stat = cudaMalloc(&dk, nbytesQKV);
+    CUDACheck(stat, "malloc");
+    stat = cudaMalloc(&dv, nbytesQKV);
+    CUDACheck(stat, "malloc");
+    stat = cudaMalloc(&d_out, nbytesQKV);
+    CUDACheck(stat, "malloc");
+    
+    
+    stat = cudaMalloc(&global_max, nbytesSum);
+    CUDACheck(stat, "malloc");
+    stat = cudaMalloc(&global_sum, nbytesSum);
+    CUDACheck(stat, "malloc");
+
+    stat = cudaMemcpy(dq, q, nbytesQKV, cudaMemcpyHostToDevice);
+    CUDACheck(stat, "memcpy");
+    stat = cudaMemcpy(dk, k, nbytesQKV, cudaMemcpyHostToDevice);
+    CUDACheck(stat, "memcpy");
+    stat = cudaMemcpy(dv, v, nbytesQKV, cudaMemcpyHostToDevice);
+    CUDACheck(stat, "memcpy");
+    stat = cudaMemcpy(d_out, out, nbytesQKV, cudaMemcpyHostToDevice);
+    CUDACheck(stat, "memcpy");
+    
+    stat = cudaMemset(global_max, 0, nbytesSum);
+    CUDACheck(stat, "memset");
+    stat = cudaMemset(global_sum, 0, nbytesSum);
+    CUDACheck(stat, "memset");
+    
+TimerInit
+TimerStart
+    FlashAttentionKernel<Br ,Bc, Bx><<<Gx,Bx>>>(dq, dk, dv,d_out, global_sum, global_max, N, d);
+    cudaDeviceSynchronize();
+    stat = cudaGetLastError();
+    CUDACheck(stat, "kernel");
+    cudaMemcpy(out, d_out, nbytesQKV, cudaMemcpyDeviceToHost);
+TimerEnd("KK")
+    /* for (int i=0; i<N*d; ++i) { */
+    /*     printf("%.2f ", out[i]); */
+    /* } */
+    return 0;
+}

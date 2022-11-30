@@ -3,3 +3,4 @@
 gemm
 *.ipynb
 jax_test.sync.ipynb
+out.txt
